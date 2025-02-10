@@ -145,5 +145,5 @@ export type ErrorResponse = any;
 export type ExecuteOptions = {
   autoToolCall?: boolean;
   stream?: boolean;
-  streamer?: WritableStream;
+  streamer?: import("stream").Writable;
 };

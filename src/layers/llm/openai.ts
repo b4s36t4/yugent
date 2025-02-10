@@ -204,15 +204,14 @@ export class OpenAI extends LLMLayer<OpenAIMessage> {
 
     if (stream) {
       return new Promise((resolve, reject) => {
-        const writer = streamer?.getWriter();
         const transformer = this.transformToJSON();
         const passThrough = new PassThrough({
           transform: async (chunk, _, cb) => {
             try {
               const decoded = chunk.toString();
               transformer(decoded);
-              if (writer) {
-                await writer.write(decoded);
+              if (streamer) {
+                streamer.write(decoded);
               }
               cb();
             } catch (error) {
