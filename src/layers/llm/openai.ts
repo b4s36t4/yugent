@@ -155,7 +155,6 @@ export class OpenAI extends LLMLayer<OpenAIMessage> {
 
         // End the stream and push the message
         if (_chunk === "[DONE]") {
-          console.log(message);
           llmInstance.messages.push(message as any);
           return;
         }
