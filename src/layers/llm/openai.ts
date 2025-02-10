@@ -219,7 +219,10 @@ export class OpenAI extends LLMLayer<OpenAIMessage> {
           },
         });
         request.body.pipe(passThrough);
-        request.body.on("close", () => resolve(null));
+        request.body.on("close", () => {
+          streamer?.end();
+          resolve(null);
+        });
       });
     }
 
