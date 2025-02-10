@@ -1,11 +1,15 @@
 import { Client } from "undici";
 import {
   AttachType,
+  ExecuteOptions,
   LLMLayer,
   OpenAIMessage,
   Tool,
   ToolLayer,
 } from "../../type";
+import { PassThrough, Readable } from "node:stream";
+
+export type Role = "assistant" | "user" | "system" | "tool" | "tool_call";
 
 export interface OpenAIResponse {
   id: string;
@@ -13,7 +17,7 @@ export interface OpenAIResponse {
   choices: {
     index: number;
     message: {
-      role: "assistant" | "tool";
+      role: Role;
       content:
         | null
         | string
@@ -29,6 +33,33 @@ export interface OpenAIResponse {
       refusal?: any;
     };
     finish_reason: "stop" | "tool_calls" | "content_filter" | "length";
+  }[];
+}
+
+export interface OpenAIMessageChunk {
+  id: string;
+  created: number;
+  model?: string;
+  system_fingerprint: string;
+  object: "chat.completion.chunk";
+  usage?: {
+    completion_tokens: number;
+    prompt_tokens: number;
+    total_tokens: number;
+  };
+  choices: {
+    delta: {
+      content?: string;
+      role: Role;
+      tool_calls?: {
+        index: number;
+        id: string;
+        type: "function";
+        function: { name: string; arguments: string };
+      };
+    };
+    index: number;
+    finish_reason?: "stop" | "length" | "content_filter" | "tool_calls";
   }[];
 }
 
@@ -89,13 +120,14 @@ export class OpenAI extends LLMLayer<OpenAIMessage> {
     });
   };
 
-  private getBody = () => {
+  private getBody = (stream?: boolean) => {
     const tools = this.#tools.map((tool) => tool.tool.toTool?.());
 
     return {
       messages: this.messages,
       ...(tools?.length > 0 ? { tools: tools, tool_choice: "auto" } : {}),
       model: this.model,
+      ...(typeof stream === "boolean" && { stream }),
     };
   };
 
@@ -108,8 +140,57 @@ export class OpenAI extends LLMLayer<OpenAIMessage> {
     return headers;
   }
 
-  execute = async () => {
-    const body = this.getBody();
+  transformToJSON = () => {
+    let message = { content: "" } as Record<string, unknown>;
+    const llmInstance = this;
+    let fullLine = "";
+    return function (rawChunk: string) {
+      // Generate Lines.
+      const lines = rawChunk.split("\n");
+      for (const line of lines) {
+        if (!line || line.trim().length === 0) {
+          continue;
+        }
+        const _chunk = line.replace("data:", "").trim();
+
+        // End the stream and push the message
+        if (_chunk === "[DONE]") {
+          console.log(message);
+          llmInstance.messages.push(message as any);
+          return;
+        }
+
+        try {
+          // Try appending the chunk and then try parsing it, multiple chunks should make the JSON.
+          if (fullLine.length > 0) {
+            fullLine += _chunk;
+          } else {
+            fullLine = _chunk;
+          }
+          const chunk = JSON.parse(fullLine) as OpenAIMessageChunk;
+          fullLine = "";
+          const chunkData = chunk.choices ?? [];
+          chunkData.forEach((item) => {
+            if (item.delta.content) {
+              message.content += item.delta.content;
+            }
+            if (item.delta.tool_calls) {
+              message.tool_calls = item.delta.tool_calls;
+            }
+            if (item.delta.role) {
+              message.role = item.delta.role;
+            }
+          });
+        } catch (error) {
+          // fullLine += _chunk;
+        }
+      }
+    };
+  };
+
+  execute = async (options?: ExecuteOptions) => {
+    const { stream, autoToolCall = true, streamer } = options ?? {};
+    const body = this.getBody(stream);
     const request = await this.client.request({
       path: this.completionsPath,
       method: "POST",
@@ -117,11 +198,35 @@ export class OpenAI extends LLMLayer<OpenAIMessage> {
       headers: this.getHeaders(),
     });
 
+    if (request.statusCode !== 200) {
+      return request;
+    }
+
+    if (stream) {
+      return new Promise((resolve, reject) => {
+        const writer = streamer?.getWriter();
+        const transformer = this.transformToJSON();
+        const passThrough = new PassThrough({
+          transform: async (chunk, _, cb) => {
+            try {
+              const decoded = chunk.toString();
+              transformer(decoded);
+              if (writer) {
+                await writer.write(decoded);
+              }
+              cb();
+            } catch (error) {
+              reject(error);
+            }
+          },
+        });
+        request.body.pipe(passThrough);
+        request.body.on("close", () => resolve(null));
+      });
+    }
+
     try {
       const response = (await request.body.json()) as OpenAIResponse;
-      if (request.statusCode !== 200) {
-        return response;
-      }
       const choice = response.choices[0];
       const finish_reason = choice.finish_reason;
 
@@ -131,15 +236,18 @@ export class OpenAI extends LLMLayer<OpenAIMessage> {
         if (!tool_call) {
           return;
         }
-        const params = JSON.parse(tool_call.function.arguments);
-        await this.tool(
-          {
-            id: tool_call.function.name,
-            call_id: tool_call.id,
-          },
-          params
-        );
-        await this.execute();
+        // Only execute if `autoToolCall` presents.
+        if (autoToolCall) {
+          const params = JSON.parse(tool_call.function.arguments);
+          await this.tool(
+            {
+              id: tool_call.function.name,
+              call_id: tool_call.id,
+            },
+            params
+          );
+          await this.execute({ autoToolCall: false, stream: stream });
+        }
         return;
       }
 
